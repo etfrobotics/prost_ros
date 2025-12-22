@@ -34,7 +34,7 @@ sudo apt install git g++ cmake bison flex libbdd-dev libz3-dev
 ## Build Instructions
 
 1.  **Build PROST**
-    Navigate to the `prost` root directory (the parent of this package's root content) and build the planner:
+    Navigate to the `prost_ros/prost` directory and build the planner:
     ```bash
     cd prost
     ./build.py
@@ -57,7 +57,9 @@ Start the bridge, specifying the path to the `prost.py` script.
 ```bash
 rosrun prost_ros prost_bridge.py _prost_path:=/path/to/prost/prost.py
 ```
-*   **Parameters:**
+*Note*: _prost_path:=~/catkin_ws/src/prost_ros/prost/prost.py
+
+*   **Parameters: (No need to change if running all on same machine)**
     *   `host` (default: 127.0.0.1): TCP host for PROST connection.
     *   `port` (default: 2323): TCP port.
     *   `prost_path`: Absolute path to the `prost.py` executable.
@@ -65,17 +67,18 @@ rosrun prost_ros prost_bridge.py _prost_path:=/path/to/prost/prost.py
 ### 2. Run Demos
 We provide several example clients to demonstrate usage.
 
-**Elevator Domain (Standard Benchmark):**
-Simulates an elevator moving between floors.
-```bash
-rosrun prost_ros elevator_demo.py
-```
-
 **Navigation Domain:**
 Simulates a robot navigating a grid world.
 ```bash
+cd ~/catkin_ws/src/prost_ros/prost/testbed/benchmarks/navigation-2011
 rosrun prost_ros navigation_demo.py
 ```
+or
+```bash
+cd ~/catkin_ws/src/prost_ros/prost/testbed/benchmarks/navigation-2011
+rosrun prost_ros navigation_demo_v2.py
+```
+in V2 demo, we are simulating unsecessful robot action by not moving the robot in every other simulation step.
 
 ## ROS API
 
