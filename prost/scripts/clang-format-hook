@@ -1,0 +1,15 @@
+#!/bin/sh
+files="`hg status -n -m -a --include re:.*\.cc$ --include re:.*\.h$ --exclude re:.*gtest`"
+all_files_match=true
+for FILE in $files
+do
+    echo | clang-format-3.8 $FILE | diff -u $FILE -
+    if [ $? -ne 0 ]; then 
+        echo "$FILE violates code formatting style."
+        all_files_match=false
+    fi
+done
+if [ $all_files_match = false ]; then 
+    echo "Error: commit unsuccessful."
+    exit 1;
+fi
