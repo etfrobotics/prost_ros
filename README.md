@@ -115,3 +115,6 @@ To use PROST with your own robot:
 
 ## Known Issues
 *   **"Text file busy" on reset**: If you restart a planning session quickly, you might see an error because the previous PROST process hasn't fully released the file lock. Wait a few seconds or restart the `prost_bridge` node.
+
+## Aceknowledment
+*   Khalifa University project HARBOT funds this development.
