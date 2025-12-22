@@ -1,0 +1,5 @@
+string domain_content
+string instance_content
+int32 timeout
+---
+bool success
