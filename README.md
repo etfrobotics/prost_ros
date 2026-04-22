@@ -55,7 +55,7 @@ sudo apt install git g++ cmake bison flex libbdd-dev libz3-dev
 Start the bridge, specifying the path to the `prost.py` script.
 
 ```bash
-rosrun prost_ros prost_bridge.py _prost_path:=/path/to/prost/prost.py
+rosrun prost_ros prost_bridge.py _prost_path:=~/catkin_ws/src/prost_ros/prost/prost.py
 ```
 *Note*: _prost_path:=~/catkin_ws/src/prost_ros/prost/prost.py
 
