@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import json
 import re
 import rospy
 import socket
@@ -382,21 +383,32 @@ class ProstBridge:
 
         if not actions:
                 return SubmitObservationResponse(action_name="NOOP", action_params=[])
-        
-        # Take first action (PROST usually returns one concurrent step, potentially multiple actions)
-        # ROS wrapper simplifies to returning lists? Or just one?
-        # User interface: action_name (string), action_params (string[])
-        # If multiple actions, we might need a better msg. But usually in standard RDDL domains it's one action or factored.
-        # Let's return the first one for now.
+
         rospy.loginfo("AKCIJE")
         rospy.loginfo(actions)
-        act = actions[0]
-        name = act.find('action-name').text
-        args = [arg.text for arg in act.findall('action-arg')]
-        
-        self.action_pub.publish(f"{name}({','.join(args)})")
-        
-        return SubmitObservationResponse(action_name=name, action_params=args)
+
+        if len(actions) == 1:
+            # Single-robot / single-action path — unchanged behaviour.
+            act = actions[0]
+            name = act.find('action-name').text
+            args = [arg.text for arg in act.findall('action-arg')]
+            self.action_pub.publish(f"{name}({','.join(args)})")
+            return SubmitObservationResponse(action_name=name, action_params=args)
+
+        # Multi-robot concurrent path: encode all actions as a JSON list in
+        # action_params[0] and signal this with action_name="JOINT".
+        # Each element: [action_name, arg0, arg1, ...]
+        all_actions = []
+        for act in actions:
+            name = act.find('action-name').text
+            args = [arg.text for arg in act.findall('action-arg')]
+            all_actions.append([name] + args)
+
+        self.action_pub.publish(json.dumps(all_actions))
+        return SubmitObservationResponse(
+            action_name="JOINT",
+            action_params=[json.dumps(all_actions)],
+        )
 
         #except ET.ParseError as e:
         #    rospy.logerr(f"XML Parse Error: {e}")
