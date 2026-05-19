@@ -9,6 +9,8 @@ import sys
 import os
 import subprocess
 import base64
+import tempfile
+import shutil as _shutil
 import xml.etree.ElementTree as ET
 from std_msgs.msg import String
 from prost_ros.srv import StartPlanning, StartPlanningResponse, SubmitObservation, SubmitObservationResponse
@@ -100,6 +102,10 @@ class ProstBridge:
             self.proc.terminate()
             if self.client_socket:
                 self.client_socket.close()
+            tmpdir = getattr(self, "_prost_tmpdir", None)
+            if tmpdir and os.path.isdir(tmpdir):
+                _shutil.rmtree(tmpdir, ignore_errors=True)
+                self._prost_tmpdir = None
 
         if not self.server_socket:
             self.start_server()
@@ -165,10 +171,8 @@ class ProstBridge:
             return StartPlanningResponse(False)
 
         try:
-            # We must use absolute path for prost.py if not in PATH
-            # Assuming prost_path is absolute or relative to CWD.
-            # Ideally CWD should be the PROST root.
-            workspace_dir = os.path.dirname(os.path.abspath(self.prost_path))
+            workspace_dir = tempfile.mkdtemp(prefix="prost_run_")
+            self._prost_tmpdir = workspace_dir
             self.proc = subprocess.Popen(
                 cmd,
                 cwd=workspace_dir,
