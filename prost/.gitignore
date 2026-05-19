@@ -1,0 +1,10 @@
+*~
+*.o
+*.pyc
+*.q
+*.log
+*.err
+*.swp
+builds/
+testbed/benchmarks/test
+testbed/experiments/issue-*/*/*

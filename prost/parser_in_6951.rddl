@@ -1,0 +1,423 @@
+domain fruit_collection {
+    
+    requirements = {
+        concurrent,
+        reward-deterministic
+    };
+    
+    types {
+        location : object;         
+        aisle_position : object;   
+    };
+    
+    pvariables {
+        
+       
+        unload_station(aisle_position) : { non-fluent, bool, default = false };
+        adjacent(aisle_position, aisle_position) : { non-fluent, bool, default = false };
+        reachable_from(location, aisle_position) : { non-fluent, bool, default = false };
+        distance(aisle_position, aisle_position) : { non-fluent, real, default = 1.0 };
+        
+        fruit_weight(location) : { non-fluent, real, default = 1.0 };
+        fruit_ripe(location) : { non-fluent, bool, default = true };
+        
+        GRASP_SUCCESS_PROB : { non-fluent, real, default = 0.9};
+        MAX_CAPACITY : { non-fluent, real, default = 100.0};
+        CAPACITY_THRESHOLD : { non-fluent, real, default = 90.0};
+        MAX_FRUIT_WEIGHT : { non-fluent, real, default = 2.0 };
+    
+        // robot current position
+        robot_at(aisle_position) : { state-fluent, bool, default = false };
+        
+        // Fruit states
+        fruit_at(location) : { state-fluent, bool, default = false };              
+        fruit_collected(location) : { state-fluent, bool, default = false };       
+        fruit_in_bin(location) : { state-fluent, bool, default = false };          
+        fruits_unloaded(location) : { state-fluent, bool, default = false };       
+        
+        position_visited(aisle_position) : { state-fluent, bool, default = false };
+        navigate(aisle_position) : { action-fluent, bool, default = false };
+        grasp_fruit(location) : { action-fluent, bool, default = false };
+        load_to_bin(location) : { action-fluent, bool, default = false };
+        unload : { action-fluent, bool, default = false };
+    };
+     
+    // Conditional Probability Functions 
+ 
+    cpfs {
+        robot_at'(?a) = 
+            if (navigate(?a)) 
+                then true
+            else if (exists_{?a2 : aisle_position} [navigate(?a2) ^ (?a2 ~= ?a)])
+                then false
+            else robot_at(?a);
+
+        fruit_at'(?l) = 
+            if (grasp_fruit(?l) ^ 
+                exists_{?a : aisle_position} [robot_at(?a) ^ reachable_from(?l, ?a)] ^ 
+                fruit_at(?l)) then
+                if (Bernoulli(GRASP_SUCCESS_PROB))
+                    then false  // Successfully grasped
+                    else true   // Failed to grasp
+            else fruit_at(?l);
+
+        fruit_collected'(?l) = 
+            if (unload ^ fruit_in_bin(?l) ^ 
+                exists_{?a : aisle_position} [robot_at(?a) ^ unload_station(?a)])
+                then false  
+            else if (fruit_at(?l) ^ ~fruit_at'(?l))
+                then true   
+            else if (fruit_in_bin(?l))
+                then true   
+            else fruit_collected(?l);
+        
+       
+        fruit_in_bin'(?l) = 
+            if (unload ^ exists_{?a : aisle_position} [robot_at(?a) ^ unload_station(?a)])
+                then false 
+            else if (load_to_bin(?l) ^ 
+                     exists_{?a : aisle_position} [robot_at(?a) ^ reachable_from(?l, ?a)] ^ 
+                     fruit_collected(?l) ^ ~fruit_in_bin(?l))
+                then true   
+            else fruit_in_bin(?l);
+
+        // To track which positions have been completed 
+        position_visited'(?a) = 
+            if (robot_at(?a) ^ 
+                exists_{?l : location} [load_to_bin(?l) ^ reachable_from(?l, ?a)])
+                then true
+            else position_visited(?a);
+
+        fruits_unloaded'(?l) = 
+            if (unload ^ fruit_in_bin(?l) ^ 
+                exists_{?a : aisle_position} [robot_at(?a) ^ unload_station(?a)])
+                then true
+            else fruits_unloaded(?l);
+    };
+  
+    reward = 
+        (sum_{?l : location} [fruit_collected'(?l) ^ ~fruit_collected(?l) ^ fruit_ripe(?l)]) * 30.0
+        + (sum_{?l : location} [fruit_in_bin'(?l) ^ ~fruit_in_bin(?l) ^ fruit_ripe(?l)]) * 10
+        + (sum_{?l : location} [fruit_in_bin'(?l)]) * 0.2
+        + (sum_{?a : aisle_position} [robot_at'(?a) ^ unload_station(?a) ^
+            (forall_{?l : location} [~fruit_at'(?l) | ~fruit_ripe(?l)]) ^
+            (forall_{?l : location} [(fruit_collected'(?l) ^ fruit_ripe(?l)) => fruits_unloaded'(?l)])]) * 200.0
+        + (sum_{?a : aisle_position} [navigate(?a) ^ unload_station(?a) ^
+            ((sum_{?l : location} [fruit_in_bin(?l) * fruit_weight(?l)]) >= CAPACITY_THRESHOLD)]) * 500.0
+       
+        - (sum_{?a1 : aisle_position, ?a2 : aisle_position} 
+           [robot_at(?a1) ^ navigate(?a2) ^ adjacent(?a1, ?a2)] * distance(?a1, ?a2)) * 0.3
+        
+        - (sum_{?l : location} grasp_fruit(?l)) * 0.05
+        - (sum_{?l : location} load_to_bin(?l)) * 0.05
+        - unload * 0.05
+        
+        - (sum_{?a : aisle_position} [robot_at(?a) ^ ~unload_station(?a) ^
+            ((sum_{?l : location} [fruit_in_bin(?l) * fruit_weight(?l)]) >= CAPACITY_THRESHOLD) ^
+            ~exists_{?a2 : aisle_position} [navigate(?a2) ^ unload_station(?a2)]]) * 100.0
+     
+        - (sum_{?a1 : aisle_position, ?a2 : aisle_position} 
+           [robot_at(?a1) ^ navigate(?a2) ^ adjacent(?a1, ?a2) ^ 
+            ~unload_station(?a1) ^ ~unload_station(?a2) ^
+            ((sum_{?l : location} [fruit_in_bin(?l) * fruit_weight(?l)]) < CAPACITY_THRESHOLD) ^
+            exists_{?l : location} [reachable_from(?l, ?a1) ^ fruit_ripe(?l) ^
+                                    ((fruit_at(?l) ^ ~fruit_collected(?l)) | 
+                                     (fruit_collected(?l) ^ ~fruit_in_bin(?l)))]]) * 12.0;
+
+  
+    // Action preconditions
+ 
+    action-preconditions {
+        
+        forall_{?a : aisle_position} [
+            navigate(?a) => exists_{?a_current : aisle_position} [
+                robot_at(?a_current) ^ adjacent(?a_current, ?a)
+            ]
+        ];
+        
+        // cannot navigate to non-unload positions when capacity threshold is reached
+    forall_{?a : aisle_position} [
+        (navigate(?a) ^ ~unload_station(?a)) => 
+        ((sum_{?l : location} [fruit_in_bin(?l) * fruit_weight(?l)]) < CAPACITY_THRESHOLD)
+    ];
+  
+        forall_{?a : aisle_position} [
+            navigate(?a) => ~robot_at(?a)
+        ];
+  
+        forall_{?a1 : aisle_position, ?a2 : aisle_position} [
+    (robot_at(?a1) ^ navigate(?a2) ^ adjacent(?a1, ?a2) ^ ~unload_station(?a1)) => 
+    (
+        (forall_{?l : location} [
+            (reachable_from(?l, ?a1) ^ fruit_ripe(?l)) => 
+            (fruit_in_bin(?l) | ~fruit_collected(?l))  // ← CHANGED
+        ])
+        |
+        ((sum_{?l : location} [fruit_in_bin(?l) * fruit_weight(?l)]) >= CAPACITY_THRESHOLD)
+    )
+];
+  
+        forall_{?a : aisle_position} [
+            (navigate(?a) ^ unload_station(?a)) => 
+            exists_{?l : location} [fruit_in_bin(?l)]
+        ];
+    
+        forall_{?a1 : aisle_position, ?a2 : aisle_position} [
+            (robot_at(?a1) ^ unload_station(?a1) ^ navigate(?a2) ^ adjacent(?a1, ?a2)) =>
+            ~exists_{?l : location} [fruit_in_bin(?l)]
+        ];
+        
+        forall_{?a : aisle_position} [
+            navigate(?a) => (~position_visited(?a) | unload_station(?a))
+        ];
+
+        forall_{?l : location} [
+            grasp_fruit(?l) => (
+                exists_{?a : aisle_position} [robot_at(?a) ^ reachable_from(?l, ?a)] ^
+                fruit_at(?l) ^ 
+                fruit_ripe(?l) ^
+                ~fruit_in_bin(?l) ^
+                // Check capacity for this fruit
+                ((sum_{?l2 : location} [fruit_in_bin(?l2) * fruit_weight(?l2)]) + 
+                 fruit_weight(?l) <= MAX_CAPACITY)
+            )
+        ];
+        
+        forall_{?l : location} [
+            load_to_bin(?l) => (
+                exists_{?a : aisle_position} [robot_at(?a) ^ reachable_from(?l, ?a)] ^
+                fruit_collected(?l) ^ 
+                ~fruit_at(?l) ^
+                ~fruit_in_bin(?l)
+            )
+        ];
+        
+forall_{?l : location} [
+    grasp_fruit(?l) => 
+    (
+        ~exists_{?l2 : location, ?a : aisle_position} [
+            (?l2 ~= ?l) ^ 
+            robot_at(?a) ^ 
+            reachable_from(?l, ?a) ^ 
+            reachable_from(?l2, ?a) ^
+            ~fruit_at(?l2) ^           
+            fruit_collected(?l2) ^     
+            ~fruit_in_bin(?l2)         
+        ]
+    )
+];
+        
+        forall_{?l : location} [
+            load_to_bin(?l) => 
+            ((sum_{?l2 : location} [fruit_in_bin(?l2) * fruit_weight(?l2)]) + 
+             fruit_weight(?l) <= MAX_CAPACITY)
+        ];
+
+        unload => (
+            exists_{?a : aisle_position} [robot_at(?a) ^ unload_station(?a)] ^
+            exists_{?l : location} [fruit_in_bin(?l)]
+        );
+
+        forall_{?a : aisle_position} [
+            (robot_at(?a) ^ unload_station(?a) ^ 
+             exists_{?l : location} [fruit_in_bin(?l)]) =>
+            (
+                unload ^ 
+                ~exists_{?a2 : aisle_position} [navigate(?a2)] ^
+                ~exists_{?l2 : location} [grasp_fruit(?l2)] ^
+                ~exists_{?l3 : location} [load_to_bin(?l3)]
+            )
+        ];
+
+        // action limits
+
+        (sum_{?a : aisle_position} navigate(?a)) <= 1;
+        (sum_{?l : location} grasp_fruit(?l)) <= 1;
+        (sum_{?l : location} load_to_bin(?l)) <= 1;
+    };
+}
+//////////////////////////////////////////////////////////////////////
+// Navigation: Zigzag pattern U-turn
+//////////////////////////////////////////////////////////////////////
+
+non-fluents fruit_multi_aisle_nf {
+    domain = fruit_collection;
+
+    objects {
+        location : {l1, l2, l3, l4, l5, l6, l7, l8, l9, l10};
+        aisle_position : {a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15, a16, a17, a18, a19, a20, a21, unload1, unload2};
+    };
+
+    non-fluents {
+        unload_station(unload1);
+        unload_station(unload2);
+
+        // adjacency
+        // Aisle 1 (Forward)
+        adjacent(a1, a2);
+        adjacent(a2, a1);
+        adjacent(a2, a3);
+        adjacent(a3, a2);
+        adjacent(a3, a4);
+        adjacent(a4, a3);
+        adjacent(a4, a5);
+        adjacent(a5, a4);
+        adjacent(a5, a6);
+        adjacent(a6, a5);
+        adjacent(a6, a7);
+        adjacent(a7, a6);
+
+        // Aisle 2 (Backward)
+        adjacent(a14, a13);
+        adjacent(a13, a14);
+        adjacent(a13, a12);
+        adjacent(a12, a13);
+        adjacent(a12, a11);
+        adjacent(a11, a12);
+        adjacent(a11, a10);
+        adjacent(a10, a11);
+        adjacent(a10, a9);
+        adjacent(a9, a10);
+        adjacent(a9, a8);
+        adjacent(a8, a9);
+        // Aisle 3 (Foward)
+        adjacent(a15, a16);
+        adjacent(a16, a15);
+        adjacent(a16, a17);
+        adjacent(a17, a16);
+        adjacent(a17, a18);
+        adjacent(a18, a17);
+        adjacent(a18, a19);
+        adjacent(a19, a18);
+        adjacent(a19, a20);
+        adjacent(a20, a19);
+        adjacent(a20, a21);
+        adjacent(a21, a20);
+        // Between-aisle transitions (Zigzag)
+        adjacent(a7, a14);
+        adjacent(a14, a7);
+        adjacent(a8, a15);
+        adjacent(a15, a8);
+
+        adjacent(unload1, a1);
+        adjacent(a1, unload1);
+        adjacent(a21, unload2);
+        adjacent(unload2, a21);
+
+        reachable_from(l1, a1);
+        reachable_from(l2, a1);
+        reachable_from(l3, a2);
+        reachable_from(l4, a2);
+        reachable_from(l5, a3);
+        reachable_from(l6, a3);
+        reachable_from(l7, a4);
+        reachable_from(l8, a4);
+        reachable_from(l9, a5);
+        reachable_from(l10, a5);
+
+
+        // distances
+        distance(a1, a2) = 1.000;
+        distance(a2, a1) = 1.000;
+        distance(a2, a3) = 1.000;
+        distance(a3, a2) = 1.000;
+        distance(a3, a4) = 1.000;
+        distance(a4, a3) = 1.000;
+        distance(a4, a5) = 1.000;
+        distance(a5, a4) = 1.000;
+        distance(a5, a6) = 1.000;
+        distance(a6, a5) = 1.000;
+        distance(a6, a7) = 1.000;
+        distance(a7, a6) = 1.000;
+        distance(a14, a13) = 1.000;
+        distance(a13, a14) = 1.000;
+        distance(a13, a12) = 1.000;
+        distance(a12, a13) = 1.000;
+        distance(a12, a11) = 1.000;
+        distance(a11, a12) = 1.000;
+        distance(a11, a10) = 1.000;
+        distance(a10, a11) = 1.000;
+        distance(a10, a9) = 1.000;
+        distance(a9, a10) = 1.000;
+        distance(a9, a8) = 1.000;
+        distance(a8, a9) = 1.000;
+        distance(a15, a16) = 1.000;
+        distance(a16, a15) = 1.000;
+        distance(a16, a17) = 1.000;
+        distance(a17, a16) = 1.000;
+        distance(a17, a18) = 1.000;
+        distance(a18, a17) = 1.000;
+        distance(a18, a19) = 1.000;
+        distance(a19, a18) = 1.000;
+        distance(a19, a20) = 1.000;
+        distance(a20, a19) = 1.000;
+        distance(a20, a21) = 1.000;
+        distance(a21, a20) = 1.000;
+        distance(a7, a14) = 5.000;
+        distance(a14, a7) = 5.000;
+        distance(a8, a15) = 5.000;
+        distance(a15, a8) = 5.000;
+        distance(unload1, a1) = 2.0;
+        distance(a1, unload1) = 2.0;
+        distance(a21, unload2) = 2.0;
+        distance(unload2, a21) = 2.0;
+
+        GRASP_SUCCESS_PROB = 0.9;
+        MAX_CAPACITY = 100.0;
+        CAPACITY_THRESHOLD = 90.0;
+
+        // fruit properties
+        fruit_weight(l1) = 0.9;
+        fruit_weight(l2) = 1.8;
+        fruit_weight(l3) = 1.3;
+        fruit_weight(l4) = 1.7;
+        fruit_weight(l5) = 1.9;
+        fruit_weight(l6) = 1.7;
+        fruit_weight(l7) = 0.6;
+        fruit_weight(l8) = 1.6;
+        fruit_weight(l9) = 1.0;
+        fruit_weight(l10) = 1.3;
+
+        
+        // ripeness
+        fruit_ripe(l1) = true;
+        fruit_ripe(l2) = true;
+        fruit_ripe(l3) = true;
+        fruit_ripe(l4) = true;
+        fruit_ripe(l5) = true;
+        fruit_ripe(l6) = true;
+        fruit_ripe(l7) = true;
+        fruit_ripe(l8) = false;
+        fruit_ripe(l9) = true;
+        fruit_ripe(l10) = true;
+
+    };
+}
+
+instance fruit_inst {
+    domain = fruit_collection;
+    non-fluents = fruit_multi_aisle_nf;
+
+    init-state {
+        // robot initial state
+        robot_at(a1);
+        position_visited(a1, ture)
+
+        // fruits initially present
+        fruit_at(l1);
+        fruit_at(l2);
+        fruit_at(l3);
+        fruit_at(l4);
+        fruit_at(l5);
+        fruit_at(l6);
+        fruit_at(l7);
+        fruit_at(l8);
+        fruit_at(l9);
+        fruit_at(l10);
+
+    };
+
+    max-nondef-actions = 1;
+    horizon = 150;
+    discount = 0.95;
+}

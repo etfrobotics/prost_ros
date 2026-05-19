@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-
+import re
 import rospy
 import socket
 import struct
@@ -22,6 +22,13 @@ class ProstBridge:
         self.port = rospy.get_param('~port', 2323)
         self.rounds = rospy.get_param('~rounds', 100) # Number of rounds for the session
         self.time_allowed = rospy.get_param('~time_allowed', 1200) # Total time allowed
+        self.ram_limit_kb = rospy.get_param('~ram_limit_kb', 1048576)
+
+        self.parser_options = rospy.get_param('~parser_options', '-ipc2018 -fdrActions 0')
+        self.search_engine = rospy.get_param(
+            '~search_engine',
+            '[Prost -s 1 -se [IPC2014 -t 1.0]]')
+        self.search_engine = self._ensure_ram_limit(self.search_engine)
 
         self.server_socket = None
         self.client_socket = None
@@ -32,6 +39,7 @@ class ProstBridge:
         self.current_instance = None
         self.next_action = None
         self.action_ready_event = threading.Event()
+        self.proc_output_thread = None
 
         self.start_service = rospy.Service('~start_planning', StartPlanning, self.handle_start_planning)
         self.obs_service = rospy.Service('~submit_observation', SubmitObservation, self.handle_submit_observation)
@@ -40,6 +48,38 @@ class ProstBridge:
         self.action_pub = rospy.Publisher('~action', String, queue_size=10)
 
         rospy.loginfo("ProstBridge initialized. Waiting for start_planning call.")
+
+    def _ensure_ram_limit(self, search_engine):
+        if re.search(r'(?<!\S)-ram\s+\d+', search_engine):
+            rospy.loginfo("Using explicit PROST RAM limit from search_engine.")
+            return search_engine
+
+        ram_limit_kb = int(self.ram_limit_kb)
+        patched = search_engine.replace('[Prost', f'[Prost -ram {ram_limit_kb}', 1)
+        if patched == search_engine:
+            rospy.logwarn(
+                "Could not inject PROST RAM limit into search_engine '%s'. "
+                "Continuing without an automatic RAM cap.",
+                search_engine,
+            )
+            return search_engine
+
+        rospy.loginfo(
+            "Injected PROST RAM limit of %d KB into search_engine to reduce OOM kills.",
+            ram_limit_kb,
+        )
+        return patched
+
+    def _stream_prost_output(self):
+        if not self.proc or not self.proc.stdout:
+            return
+        try:
+            for line in self.proc.stdout:
+                line = line.rstrip()
+                if line:
+                    rospy.logwarn(f"[PROST] {line}")
+        except Exception as e:
+            rospy.logwarn(f"Stopped reading PROST output: {e}")
 
     def start_server(self):
         self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -77,17 +117,37 @@ class ProstBridge:
         # Let's assume we concat domain + \n + instance.
         self.task_content = req.domain_content + "\n" + req.instance_content
 
-        # Determine instance name from content or dummy
-        instance_name = "unknown_instance" 
-        # (Ideally we'd parse it, but we can pass a dummy name to start PROST)
-        
-        cmd = [
-            self.prost_path,
-            instance_name,
+        # FIX: Parse the actual instance name from the RDDL content
+        # Looks for: instance <name> {
+        match = re.search(r'instance\s+(\w+)\s*\{', self.task_content)
+        if match:
+            instance_name = match.group(1)
+            rospy.loginfo(f"Detected RDDL Instance Name: {instance_name}")
+        else:
+            instance_name = "unknown_instance"
+            rospy.logwarn("Could not parse instance name from RDDL. Defaulting to 'unknown_instance'.")
+
+        cmd = [self.prost_path, instance_name]
+
+        if self.parser_options:
+            cmd += ["--parser-options", self.parser_options]
+
+        cmd += [
             "--hostname", self.host,
             "--port", str(self.port),
-            "[Prost -s 1 -se [IPC2014]]" # Default configuration
+            self.search_engine
         ]
+
+        timeout_match = re.search(r'(?<!\S)-t\s+([0-9]*\.?[0-9]+)', self.search_engine)
+        if timeout_match:
+            search_timeout = float(timeout_match.group(1))
+            if search_timeout > 60.0:
+                rospy.logwarn(
+                    "Configured PROST search timeout is %.3fs per decision. "
+                    "That is unusually high and may cause the planner to be killed "
+                    "by memory or runtime limits on large domains.",
+                    search_timeout,
+                )
         
         rospy.loginfo(f"Starting PROST: {' '.join(cmd)}")
         
@@ -108,7 +168,19 @@ class ProstBridge:
             # Assuming prost_path is absolute or relative to CWD.
             # Ideally CWD should be the PROST root.
             workspace_dir = os.path.dirname(os.path.abspath(self.prost_path))
-            self.proc = subprocess.Popen(cmd, cwd=workspace_dir)
+            self.proc = subprocess.Popen(
+                cmd,
+                cwd=workspace_dir,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+            )
+            self.proc_output_thread = threading.Thread(
+                target=self._stream_prost_output,
+                daemon=True,
+            )
+            self.proc_output_thread.start()
         except Exception as e:
             rospy.logerr(f"Failed to start PROST: {e}")
             return StartPlanningResponse(False)
@@ -166,6 +238,8 @@ class ProstBridge:
         # Read session-request
         # <session-request><problem-name>...</problem-name>...</session-request>
         data = self.read_xml_message()
+        rospy.logwarn(f"ROUND REQUEST: {data}")
+
         if not data:
             return False
         rospy.loginfo(f"Received session-request: {data}")
@@ -178,15 +252,16 @@ class ProstBridge:
         # but standard is likely <session-init>. (Wait, client doesn't check root name in initSession, just dissects)
         
         encoded_task = base64.b64encode(self.task_content.encode('utf-8')).decode('utf-8')
-        
+        time_ms = int(self.time_allowed * 1000)
         # Prepare response
         # Using string formatting for simplicity.
         # Removing XML header as PROST's strxml.cc might not support processing instructions like <?xml ... ?>
         resp = f"""<session-init>
   <task>{encoded_task}</task>
   <num-rounds>{self.rounds}</num-rounds>
-  <time-allowed>{timeout}</time-allowed>
+  <time-allowed>{time_ms}</time-allowed>
 </session-init>\0"""
+        rospy.logwarn(f"ROUND INIT SENDING: {resp}")
         self.send_xml_message(resp)
         return True
 
@@ -196,11 +271,11 @@ class ProstBridge:
         if not data: return False
         # rospy.loginfo(f"Received round-request: {data}")
         # root name should be round-request
-        
+        time_ms = int(self.time_allowed * 1000)
         # Send round-init
         # <round-init><time-left>...</time-left></round-init>
         resp = f"""<round-init>
-<time-left>{self.time_allowed}</time-left>
+<time-left>{time_ms}</time-left>
 </round-init>\0"""
         self.send_xml_message(resp)
         return True
@@ -219,11 +294,12 @@ class ProstBridge:
         #   <time-left>...</time-left>
         #   <immediate-reward>...</immediate-reward>
         # </turn>
-        
+        rospy.loginfo("Prihvacena observacija")
         xml_parts = []
+        time_ms = int(self.time_allowed * 1000)
         # xml_parts.append('<?xml version="1.0" encoding="UTF-8"?>')
         xml_parts.append('<turn>')
-        xml_parts.append(f'<time-left>{self.time_allowed}</time-left>') # Should technically decrease
+        xml_parts.append(f'<time-left>{time_ms}</time-left>') # Should technically decrease
         xml_parts.append(f'<immediate-reward>{req.reward}</immediate-reward>')
         
         if not req.observation:
@@ -263,45 +339,68 @@ class ProstBridge:
         xml_parts.append('\0')
         
         msg = "".join(xml_parts)
+        #rospy.logwarn("=== SENDING TO PROST ===")
+        #rospy.logwarn(msg)
         self.send_xml_message(msg)
-        
+        rospy.loginfo("Observacije poslate cekamo akcije")
         # Read Response (Actions)
         # <actions><action>...</action></actions>
         data = self.read_xml_message()
+        #rospy.logwarn("=== RECEIVED FROM PROST ===")
+        #rospy.logwarn(data)
         if not data:
+            exit_code = self.proc.poll() if self.proc else None
+            if exit_code is not None:
+                if exit_code < 0:
+                    rospy.logerr(
+                        "PROST terminated by signal %d while waiting for an action. "
+                        "This is often caused by an OOM kill; try lowering ~ram_limit_kb "
+                        "or the search timeout.",
+                        -exit_code,
+                    )
+                else:
+                    rospy.logerr("PROST exited with code %d while waiting for an action.", exit_code)
             return SubmitObservationResponse(action_name="FAILED", action_params=[])
             
         # Parse XML
         # Remove null byte
         if data.endswith('\0'): data = data[:-1]
+        rospy.loginfo("DATA:")
+        print(data)
+        rospy.loginfo(data)
+        #try:
+        root = ET.fromstring(data)
+        if root.tag == "round-end":
+            rospy.loginfo("Round ended.")
+            return SubmitObservationResponse(action_name="ROUND_END", action_params=[])
         
-        try:
-            root = ET.fromstring(data)
-            if root.tag == "round-end":
-                rospy.loginfo("Round ended.")
-                return SubmitObservationResponse(action_name="ROUND_END", action_params=[])
-            
-            # Expect <actions>
-            actions = root.findall('action')
-            if not actions:
-                 return SubmitObservationResponse(action_name="NOOP", action_params=[])
-            
-            # Take first action (PROST usually returns one concurrent step, potentially multiple actions)
-            # ROS wrapper simplifies to returning lists? Or just one?
-            # User interface: action_name (string), action_params (string[])
-            # If multiple actions, we might need a better msg. But usually in standard RDDL domains it's one action or factored.
-            # Let's return the first one for now.
-            act = actions[0]
-            name = act.find('action-name').text
-            args = [arg.text for arg in act.findall('action-arg')]
-            
-            self.action_pub.publish(f"{name}({','.join(args)})")
-            
-            return SubmitObservationResponse(action_name=name, action_params=args)
+        # Expect <actions>
+        actions = root.findall('action')
+        rospy.logwarn(f"Number of actions in PROST response: {len(actions)}")
+        rospy.logwarn(f"Full PROST response root tag: {root.tag}")
+        rospy.logwarn(f"Full PROST response: {ET.tostring(root, encoding='unicode')}")
 
-        except ET.ParseError as e:
-            rospy.logerr(f"XML Parse Error: {e}")
-            return SubmitObservationResponse(action_name="ERROR", action_params=[])
+        if not actions:
+                return SubmitObservationResponse(action_name="NOOP", action_params=[])
+        
+        # Take first action (PROST usually returns one concurrent step, potentially multiple actions)
+        # ROS wrapper simplifies to returning lists? Or just one?
+        # User interface: action_name (string), action_params (string[])
+        # If multiple actions, we might need a better msg. But usually in standard RDDL domains it's one action or factored.
+        # Let's return the first one for now.
+        rospy.loginfo("AKCIJE")
+        rospy.loginfo(actions)
+        act = actions[0]
+        name = act.find('action-name').text
+        args = [arg.text for arg in act.findall('action-arg')]
+        
+        self.action_pub.publish(f"{name}({','.join(args)})")
+        
+        return SubmitObservationResponse(action_name=name, action_params=args)
+
+        #except ET.ParseError as e:
+        #    rospy.logerr(f"XML Parse Error: {e}")
+        #    return SubmitObservationResponse(action_name="ERROR", action_params=[])
 
 
     def read_xml_message(self):
@@ -312,6 +411,20 @@ class ProstBridge:
             try:
                 chunk = self.client_socket.recv(4096)
                 if not chunk:
+                    exit_code = self.proc.poll() if self.proc else None
+                    if exit_code is None:
+                        rospy.logerr("PROST socket closed before sending a complete XML message.")
+                    else:
+                        if exit_code < 0:
+                            rospy.logerr(
+                                "PROST process was terminated by signal %d before sending a complete XML message.",
+                                -exit_code,
+                            )
+                        else:
+                            rospy.logerr(
+                                "PROST process exited with code %d before sending a complete XML message.",
+                                exit_code,
+                            )
                     break
                 buf += chunk
                 if b'\0' in chunk:
